@@ -1,0 +1,186 @@
+---
+title: "WRAP longitudinal assays"
+output:
+  html_document:
+    df_print: paged
+---
+## Setup
+### Load required libraries
+
+```{r, message=F, warning=F}
+library(tidyverse)
+library(readxl)
+library(janitor)
+library(viridis)
+library(cowplot)
+library(grid)
+library(lemon)
+library(patchwork)
+library(tcltk)
+
+```
+
+### Define base directories
+
+```{r}
+dir_root    <- dirname(dirname(rstudioapi::getActiveDocumentContext()$path))
+dir_data    <- file.path(dir_root, "data")
+dir_helpers <- file.path(dir_root, "bin", "helpers")
+dir_figures <- file.path(dir_root, "figures")
+dir_results <- file.path(dir_root, "results")
+
+```
+
+### Load helper functions
+
+```{r}
+source(file.path(dir_helpers, "generate_spaguetti_plots.R"))
+source(file.path(dir_helpers, "label_analyzer_samples.R"))
+```
+
+### Files and manifests to import
+```{r}
+assay_files <- list.files(file.path(dir_data, "raw"), pattern = ".csv")
+
+manifest_files <- list.files(file.path(dir_data, "raw"), pattern = ".xlsx")
+
+```
+
+
+## Import and clean data
+### Match manifest ids with assay readings
+```{r}
+
+label_analyzer_samples(dir_source = file.path(dir_data, "raw"), dir_export = dir_data)
+
+```
+
+### Separate and clean names for analysis
+
+```{r}
+
+
+
+```
+
+### Combine datasets for plotting
+```{r}
+data_joint_targets <- bind_rows(data_ptau217, data_gfap, data_nfl, 
+                                data_ab40, data_ab42, data_ratio_ab42) 
+
+
+```
+
+
+## Plot results
+### Define custom scales and paired comparison bar positions
+```{r}
+scales_y <- list(`ptau217`    = scale_y_continuous(name = "", limits = c(0, 1.7), breaks = seq(0, 1.7, 0.4)),
+                 `nfl`        = scale_y_continuous(name = "", limits = c(0, 635), breaks = seq(0, 635, 150)),
+                 `gfap`       = scale_y_continuous(name = "", limits = c(0, 150), breaks = seq(0, 150, 50)),
+                 `ab40`       = scale_y_continuous(name = "", limits = c(0, 130), breaks = seq(0, 130, 26)),
+                 `ab42`       = scale_y_continuous(name = "", limits = c(2, 10), breaks = seq(0, 10, 2.5)),
+                 `ratio_4240` = scale_y_continuous(name = expression(A*beta[42]/A*beta[40]), limits = c(0.04, 0.12), breaks = seq(0, 0.2, 0.02))
+                 )
+
+scales_x <- list(`ptau217`    = scale_x_discrete(name = "", labels = c("0 hrs", "48 hrs", "72 hrs")),
+                 `nfl`        = scale_x_discrete(name = "", labels = c("0 hrs", "48 hrs", "72 hrs")),
+                 `gfap`       = scale_x_discrete(name = "", labels = c("0 hrs", "48 hrs", "72 hrs")),
+                 `ab40`       = scale_x_discrete(name = "", labels = c("0 hrs", "48 hrs", "72 hrs")),
+                 `ab42`       = scale_x_discrete(name = "", labels = c("0 hrs", "48 hrs", "72 hrs")),
+                 `ratio_4240` = scale_x_discrete(name = "", labels = c("0 hrs", "48 hrs", "72 hrs"))
+                 )
+
+comparison_positions <- list(`ptau217`    = c(1, 1.2, 1.1),
+                             `nfl`        = c(1, 1.2, 1.1),
+                             `gfap`       = c(1, 1.2, 1.1),
+                             `ab40`       = c(102, 118, 110),
+                             `ab42`       = c(8, 9, 8.5),
+                             `ratio_4240` = c(0.09, 0.10, 0.095))
+
+```
+
+### Initialize plot components
+```{r}
+common_y_title <- textGrob("Concentration (pg/ml)", 
+                           gp  = gpar(fontsize = 9, fontfamily = "serif"), 
+                           rot = 90)
+
+common_x_title <- textGrob("Hours before freeze", 
+                           gp = gpar(fontsize = 9, fontfamily = "serif"))
+
+anova_results     <- list()
+comparison_labels <- list()
+target_panels     <- list()
+
+```
+
+### Loop around all the metrics and create individual panels
+```{r}
+
+for (i_target in 1:n_targets) {
+  
+  anova_results[[i_target]] <- oneway_anova(data         = filter(data_joint_targets, 
+                                                                  target == target_names[i_target]),
+                                            x            = hours_before_freeze, 
+                                            y            = replicate_conc, 
+                                            paired       = T,
+                                            subject.id   = identifier,
+                                            effsize.type = "eta")
+  
+  comparison_labels[[i_target]] <- generate_pairwise_labels(dataset = filter(data_joint_targets, 
+                                                                              target == target_names[i_target]),
+                                                             x      = hours_before_freeze,
+                                                             y      = replicate_conc)
+  
+  target_panels[[i_target]] <- generate_spaguetti_plot(filter(data_joint_targets, 
+                                                              target == target_names[i_target]),
+                                                       response  = replicate_conc, 
+                                                       font_size = 10) +
+  
+  scales_y[[i_target]] +
+    
+  scales_x[[i_target]] +
+  
+  facet_rep_wrap(target ~ .,
+                 labeller = label_parsed) +
+  
+  theme(strip.background = element_rect(fill = "#680001"),
+        strip.text       = element_text(color = "white", 
+                                        size  = 10, 
+                                        face  = "bold"))
+  
+  ##### Highlighting ratio plot
+  if (i_target == 6) {
+    
+    target_panels[[i_target]] <- target_panels[[i_target]] +
+      
+      theme(plot.background = element_rect(colour    = "#680001", 
+                                           fill      = "white", 
+                                           linetype  = "dotted",
+                                           linewidth = 1))
+    
+  }
+  
+  }
+```
+
+### Render panel with combined plots
+```{r, fig.width=6, fig.height=5.5}
+combined_panel  <- plot_grid(target_panels[[1]], target_panels[[2]], target_panels[[3]], 
+                             target_panels[[4]], target_panels[[5]], target_panels[[6]],
+                             labels = "AUTO",
+                             label_size = 11)
+
+final_plot <- gridExtra::grid.arrange(gridExtra::arrangeGrob(combined_panel, 
+                                                             left   = common_y_title, 
+                                                             bottom = common_x_title))
+
+```
+
+### Export plot
+```{r}
+ggsave(final_plot, filename = file.path(dir_figures, "assay_panel.png"), dpi = 300)
+
+```
+
