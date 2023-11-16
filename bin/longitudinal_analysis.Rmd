@@ -7,21 +7,18 @@ output:
 ## Setup
 ### Load required libraries
 
-```{r, message=F, warning=F}
+```{r}
 library(tidyverse)
+library(cowplot)
+library(lemon)
 library(readxl)
 library(janitor)
-library(viridis)
-library(cowplot)
-library(grid)
-library(lemon)
 library(patchwork)
-library(tcltk)
+library(latex2exp)
 
 ```
 
 ### Define base directories
-
 ```{r}
 dir_root    <- dirname(dirname(rstudioapi::getActiveDocumentContext()$path))
 dir_data    <- file.path(dir_root, "data")
@@ -31,156 +28,670 @@ dir_results <- file.path(dir_root, "results")
 
 ```
 
-### Load helper functions
-
-```{r}
-source(file.path(dir_helpers, "generate_spaguetti_plots.R"))
-source(file.path(dir_helpers, "label_analyzer_samples.R"))
-```
-
-### Files and manifests to import
-```{r}
-assay_files <- list.files(file.path(dir_data, "raw"), pattern = ".csv")
-
-manifest_files <- list.files(file.path(dir_data, "raw"), pattern = ".xlsx")
-
-```
-
-
 ## Import and clean data
-### Match manifest ids with assay readings
-```{r}
+### Load assay and PET dataset
 
-label_analyzer_samples(dir_source = file.path(dir_data, "raw"), dir_export = dir_data)
+```{r}
+load(file = file.path(dir_results, "datasets", "data_plasma_assays_clean.RData"))
+
+raw_pet <- read.csv(file.path(dir_data, "auxiliar", "pet_data.csv")) |> 
+  clean_names()
+
+raw_panda <- read.csv(file.path(dir_data, "auxiliar", "panda_visits.csv"))
 
 ```
 
-### Separate and clean names for analysis
-
+### Clean datasets and prepare data to plot
 ```{r}
+data_assay <- assay_data_clean |>  
+  select(reggie_id, enumber, obtained_date, ptau_conc = mean_conc) |> 
+  arrange(reggie_id, obtained_date) |> 
+  mutate(year_visit = lubridate::year(obtained_date)) |> 
+  group_by(reggie_id, year_visit) |> 
+  mutate(events_year = n()) |> 
+  ungroup() |> 
+  filter(events_year == 1) |>
+  select(-c(obtained_date, events_year)) 
 
+data_pet <- raw_pet |> 
+  filter(tracer == "PiB") |> 
+  mutate(petscan_date = as.POSIXct(petscan_date, 
+                                   format = "%Y-%m-%d")) |> 
+  select(reggie_id = reggieid, petscan_date, pib_index) |> 
+  arrange(reggie_id, petscan_date) |> 
+  mutate(year_visit = lubridate::year(petscan_date)) |> 
+  group_by(reggie_id, year_visit) |> 
+  mutate(events_year = n()) |> 
+  ungroup() |> 
+  filter(events_year == 1) |> 
+  select(reggie_id, year_visit, pib_index)
 
+data_demo <- raw_panda |> 
+  select(reggie_id = reggieid, gender,
+         dob = dob_first_of_quarter, 
+         apoe_e1, apoe_e2) |> 
+  mutate(dob = as.POSIXct(dob, 
+                          format = "%Y-%m-%d"),
+         dob = lubridate::year(dob)) |> 
+  distinct() |> 
+  arrange(reggie_id) |> 
+  filter(!is.na(dob))
 
+data_biomarkers <- left_join(data_assay, data_pet) |> 
+  select(reggie_id, enumber, year_visit,
+         ptau_conc, pib_index) |> 
+  arrange(reggie_id, year_visit) |> 
+  left_join(data_demo) |> 
+  mutate(age_visit = year_visit - dob) |> 
+  filter(!is.na(ptau_conc)) |> 
+  filter(!is.na(dob)) 
+  
 ```
 
-### Combine datasets for plotting
 ```{r}
-data_joint_targets <- bind_rows(data_ptau217, data_gfap, data_nfl, 
-                                data_ab40, data_ab42, data_ratio_ab42) 
-
+data_assay_plot <- data_biomarkers |> 
+  group_by(reggie_id) |> 
+  mutate(pib_level    = case_when(sum(is.na(pib_index)) == n()      ~ 1,
+                                  max(pib_index, na.rm = T) < 1.19  ~ 2,
+                                  max(pib_index, na.rm = T) >= 1.19 ~ 3),
+         change_base  = log2(ptau_conc/ptau_conc[1]),
+         change_last  = log2(rev(ptau_conc)[1]/ptau_conc[1]),
+         max_change   = max(change_base),
+         visit        = 1:n(),
+         total_visits = n(),
+         max_age      = max(age_visit),
+         time_visit   = age_visit - age_visit[1]) |> 
+  ungroup() |>
+  #filter(total_visits > 1) |> 
+  mutate(reggie_id  = as.character(reggie_id),
+         bin_change = ntile(change_last, 3),
+         bin_age    = ntile(max_age, 5),
+         bin_change = factor(bin_change, 
+                             levels = c(1:3), 
+                             labels = paste("Rate", LETTERS[1:3])),
+         bin_age    = factor(bin_age, 
+                             levels = c(1:5), 
+                             labels = paste("Age", LETTERS[1:5])),
+         pib_level  = factor(pib_level, 
+                             levels = c(1:3), 
+                             labels = c("No PiB Data", 
+                                        "AB-",
+                                        "AB+"))) |> 
+  group_by(reggie_id) |> 
+  mutate(ptau_group = case_when(all(ptau_conc <= 0.40) ~ "ptau <= 0.40 pg/mL",
+                                all(ptau_conc < 0.63)  ~ "0.40 pg/mL < ptau < 0.63 pg/mL",
+                                any(ptau_conc >= 0.63) ~ "ptau >= 0.63 pg/mL"),
+         ptau_group = factor(ptau_group,
+                             levels = c("ptau <= 0.40 pg/mL", "0.40 pg/mL < ptau < 0.63 pg/mL", "ptau >= 0.63 pg/mL")))
 
 ```
 
 
 ## Plot results
-### Define custom scales and paired comparison bar positions
+
 ```{r}
-scales_y <- list(`ptau217`    = scale_y_continuous(name = "", limits = c(0, 1.7), breaks = seq(0, 1.7, 0.4)),
-                 `nfl`        = scale_y_continuous(name = "", limits = c(0, 635), breaks = seq(0, 635, 150)),
-                 `gfap`       = scale_y_continuous(name = "", limits = c(0, 150), breaks = seq(0, 150, 50)),
-                 `ab40`       = scale_y_continuous(name = "", limits = c(0, 130), breaks = seq(0, 130, 26)),
-                 `ab42`       = scale_y_continuous(name = "", limits = c(2, 10), breaks = seq(0, 10, 2.5)),
-                 `ratio_4240` = scale_y_continuous(name = expression(A*beta[42]/A*beta[40]), limits = c(0.04, 0.12), breaks = seq(0, 0.2, 0.02))
-                 )
+plot_colors <- c("#878a89", "#F18F01", "#9c1419")
 
-scales_x <- list(`ptau217`    = scale_x_discrete(name = "", labels = c("0 hrs", "48 hrs", "72 hrs")),
-                 `nfl`        = scale_x_discrete(name = "", labels = c("0 hrs", "48 hrs", "72 hrs")),
-                 `gfap`       = scale_x_discrete(name = "", labels = c("0 hrs", "48 hrs", "72 hrs")),
-                 `ab40`       = scale_x_discrete(name = "", labels = c("0 hrs", "48 hrs", "72 hrs")),
-                 `ab42`       = scale_x_discrete(name = "", labels = c("0 hrs", "48 hrs", "72 hrs")),
-                 `ratio_4240` = scale_x_discrete(name = "", labels = c("0 hrs", "48 hrs", "72 hrs"))
-                 )
+plot_colors_alpha <- paste0(plot_colors, c("4D", "A6", "A6"))
 
-comparison_positions <- list(`ptau217`    = c(1, 1.2, 1.1),
-                             `nfl`        = c(1, 1.2, 1.1),
-                             `gfap`       = c(1, 1.2, 1.1),
-                             `ab40`       = c(102, 118, 110),
-                             `ab42`       = c(8, 9, 8.5),
-                             `ratio_4240` = c(0.09, 0.10, 0.095))
+ab_groups <- c("No PiB Data", "AB-", "AB+")
 
+ptau_groups <- c("0.40 pg/mL < ptau < 0.63 pg/mL", "ptau <= 0.40 pg/mL", "ptau >= 0.63 pg/mL")
 ```
 
-### Initialize plot components
-```{r}
-common_y_title <- textGrob("Concentration (pg/ml)", 
-                           gp  = gpar(fontsize = 9, fontfamily = "serif"), 
-                           rot = 90)
 
-common_x_title <- textGrob("Hours before freeze", 
-                           gp = gpar(fontsize = 9, fontfamily = "serif"))
+### Combined plots
+```{r, fig.width=10, fig.height=6}
 
-anova_results     <- list()
-comparison_labels <- list()
-target_panels     <- list()
-
-```
-
-### Loop around all the metrics and create individual panels
-```{r}
-
-for (i_target in 1:n_targets) {
+p <- ggplot() 
   
-  anova_results[[i_target]] <- oneway_anova(data         = filter(data_joint_targets, 
-                                                                  target == target_names[i_target]),
-                                            x            = hours_before_freeze, 
-                                            y            = replicate_conc, 
-                                            paired       = T,
-                                            subject.id   = identifier,
-                                            effsize.type = "eta")
-  
-  comparison_labels[[i_target]] <- generate_pairwise_labels(dataset = filter(data_joint_targets, 
-                                                                              target == target_names[i_target]),
-                                                             x      = hours_before_freeze,
-                                                             y      = replicate_conc)
-  
-  target_panels[[i_target]] <- generate_spaguetti_plot(filter(data_joint_targets, 
-                                                              target == target_names[i_target]),
-                                                       response  = replicate_conc, 
-                                                       font_size = 10) +
-  
-  scales_y[[i_target]] +
+  for (i_group in 1:3) {
     
-  scales_x[[i_target]] +
+    p <- p + 
+      
+      geom_path(data = filter(data_assay_plot, pib_level == ab_groups[i_group]),
+                aes(x     = age_visit,
+                    y     = ptau_conc,
+                    color = pib_level,
+                    group = reggie_id),
+                position  = position_dodge2(0.8),
+                linewidth = 0.5) +
+      
+      geom_point(data = filter(data_assay_plot, pib_level == ab_groups[i_group]),
+                 aes(x     = age_visit,
+                     y     = ptau_conc,
+                     color = pib_level,
+                     fill  = pib_level,
+                     group = reggie_id),
+                 position = position_dodge2(0.8),
+                 shape    = 21,
+                 size     = 1.5)
+    
+  }
   
-  facet_rep_wrap(target ~ .,
-                 labeller = label_parsed) +
+p <- p +
   
-  theme(strip.background = element_rect(fill = "#680001"),
+  geom_hline(yintercept = 0.40,
+             linewidth  = 0.5,
+             linetype   = "dashed",
+             color      = "#3a68fc") +
+  
+  geom_hline(yintercept = 0.63,
+             linewidth  = 0.5,
+             linetype   = "dashed",
+             color      = "#3a68fc") +
+  
+  scale_color_manual(name   = expression(A*beta~"status (from latest PiB)"), 
+                     values = c("#F18F01A6", "#9c1419A6","#878a8940"),
+                     labels = c(bquote(A*beta*"-"), bquote(A*beta*"+"), "No data")) +
+  
+  scale_fill_manual(name    = expression(A*beta~"status (from latest PiB)"), 
+                     values = c("#F18F01A6", "#9c1419A6", "#878a8940"),
+                     labels = c(bquote(A*beta*"-"), bquote(A*beta*"+"), "No data")) +
+
+  scale_y_continuous(name   = expression("[ "*pTau[217]*"] in pg/mL"),
+                     breaks = seq(0, 5, 0.5)) +
+  
+  scale_x_continuous(name = "Age", breaks = seq(0,100,5)) +
+
+  theme_bw(base_size = 12) +
+  
+  coord_flex_cart(bottom = capped_horizontal(capped = "both"), 
+                  left   = capped_vertical(capped = "both")) +
+  
+  background_grid(major = "y") +
+  
+  theme(axis.line        = element_line(),
+        panel.border     = element_blank(),
+        panel.grid.major = element_blank(), #element_line(linewidth = 0.25, linetype = "dotted"),
+        text             = element_text(family = "sans"), 
+        axis.title       = element_text(family = "sans"),
+        strip.background = element_rect(fill = "#680001"),
         strip.text       = element_text(color = "white", 
                                         size  = 10, 
-                                        face  = "bold"))
+                                        face  = "bold"),
+        legend.position  = "bottom") +
   
-  ##### Highlighting ratio plot
-  if (i_target == 6) {
+  ggtitle(bquote("Concentration of" ~ pTau[217] ~ "in plasma"))
+
+p
+
+#ggsave(filename = file.path(dir_figures, "new_absolute_ptau_217_age_combined.png"), dpi = 300)
+
+```
+
+```{r, fig.width=10, fig.height=6}
+
+p2 <- ggplot() 
+  
+
+  for (i_group in 1:3) {
     
-    target_panels[[i_target]] <- target_panels[[i_target]] +
+    p2 <- p2 + 
       
-      theme(plot.background = element_rect(colour    = "#680001", 
-                                           fill      = "white", 
-                                           linetype  = "dotted",
-                                           linewidth = 1))
+      geom_path(data = filter(data_assay_plot, ptau_group == ptau_groups[i_group]),
+                aes(x     = age_visit,
+                    y     = ptau_conc,
+                    color = ptau_group,
+                    group = reggie_id),
+                position  = position_dodge2(0.8),
+                linewidth = 0.5) +
+      
+      geom_point(data = filter(data_assay_plot, ptau_group == ptau_groups[i_group]),
+                 aes(x     = age_visit,
+                     y     = ptau_conc,
+                     color = ptau_group,
+                     fill  = ptau_group,
+                     group = reggie_id),
+                 position = position_dodge2(0.8),
+                 shape    = 21,
+                 size     = 1.5)
     
   }
   
-  }
+p2 <- p2 +
+  
+  geom_hline(yintercept = 0.40,
+             linewidth  = 0.5,
+             linetype   = "dashed",
+             color      = "#C5050C") +
+  
+  geom_hline(yintercept = 0.63,
+             linewidth  = 0.5,
+             linetype   = "dashed",
+             color      = "#C5050C") +
+  
+  scale_color_manual(name   = TeX(paste(r'($pTau_{217}$ reference range)')),  
+                     values = c("#66c2a5A6", "#8da0cbA6", "#fc8d62A6"),
+                     guide  = guide_legend(override.aes = list(color = c("#8da0cbA6", "#66c2a5A6", "#fc8d62A6"),
+                                                               fill = c("#8da0cbA6", "#66c2a5A6", "#fc8d62A6"))),
+                     labels = c("<= 0.40 pg/mL", "0.40 - 0.63 pg/mL",  " >= 0.63 pg/mL")) +
+  
+  scale_fill_manual(name   = TeX(paste(r'($pTau_{217}$ reference range)')),  
+                    values = c("#66c2a5A6", "#8da0cbA6", "#fc8d62A6"),
+                    labels = c("<= 0.40 pg/mL", "0.40 - 0.63 pg/mL",  " >= 0.63 pg/mL")) +
+
+  scale_y_continuous(name   = expression("[ "*pTau[217]*"] in pg/mL"),
+                     breaks = seq(0, 5, 0.5)) +
+  
+  scale_x_continuous(name = "Age", breaks = seq(0,100,5)) +
+
+  theme_bw(base_size = 12) +
+  
+  coord_flex_cart(bottom = capped_horizontal(capped = "both"), 
+                  left   = capped_vertical(capped = "both")) +
+  
+  background_grid(major = "y") +
+  
+  theme(axis.line        = element_line(),
+        panel.border     = element_blank(),
+        panel.grid.major = element_blank(), #element_line(linewidth = 0.25, linetype = "dotted"),
+        text             = element_text(family = "sans"), 
+        axis.title       = element_text(family = "sans"),
+        strip.background = element_rect(fill = "#680001"),
+        strip.text       = element_text(color = "white", 
+                                        size  = 10, 
+                                        face  = "bold"),
+        legend.position  = "bottom") +
+  
+  ggtitle(bquote("Concentration of" ~ pTau[217] ~ "in plasma"))
+
 ```
 
-### Render panel with combined plots
-```{r, fig.width=6, fig.height=5.5}
-combined_panel  <- plot_grid(target_panels[[1]], target_panels[[2]], target_panels[[3]], 
-                             target_panels[[4]], target_panels[[5]], target_panels[[6]],
-                             labels = "AUTO",
-                             label_size = 11)
+```{r, fig.width=10, fig.height=6}
 
-final_plot <- gridExtra::grid.arrange(gridExtra::arrangeGrob(combined_panel, 
-                                                             left   = common_y_title, 
-                                                             bottom = common_x_title))
+p3 <- ggplot(data_assay_plot) +
+  
+  geom_bar(aes(x = ptau_group,
+               fill = ptau_group)) +
+  
+  scale_y_continuous(name   = "N of participants",
+                     breaks = seq(0, 1000, 250)) +
+  
+  scale_x_discrete(name = "",
+                   labels = NULL) +
+  
+  scale_fill_manual(name   = "",  
+                    values = c("#8da0cbA6", "#66c2a5A6", "#fc8d62A6"),
+                    labels = NULL) +
+
+  theme_bw() +
+  
+  coord_flex_cart(left   = capped_vertical(capped = "both")) +
+  
+  background_grid("none") +
+  
+  guides(fill = "none") +
+  
+  theme(axis.line.y      = element_line(),
+        axis.line.x      = element_blank(),
+        axis.ticks.x     = element_blank(),
+        panel.border     = element_blank(),
+        text             = element_text(family = "sans"), 
+        axis.title       = element_text(family = "sans")) 
+
+layout <- "
+AAB
+AAB
+AAB
+AAB
+AAB
+CCC
+"
+
+p2 + p3 + guide_area() + plot_layout(guides = "collect", design = layout)
+
+ggsave(filename = file.path(dir_figures, "ptau_ashton2021_groups.png"), dpi = 300)
 
 ```
 
-### Export plot
 ```{r}
-ggsave(final_plot, filename = file.path(dir_figures, "assay_panel.png"), dpi = 300)
+p4 <- ggplot(data_assay_plot) +
+  
+  geom_bar(aes(x = ptau_group,
+               fill = pib_level),
+           position = "fill") +
+  
+  scale_y_continuous(name   = "Proportion of participants in reference ranges",
+                     breaks = seq(0, 1, 0.25)) +
+  
+  scale_x_discrete(name = "",
+                   labels = c("<=0.40\npg/mL", "0.40-0.63\npg/mL",  ">=0.63\npg/mL")) +
+  
+  scale_fill_manual(name   = "",  
+                    values = c("#878a8940", "#F18F01A6", "#9c1419A6")) +
+
+  theme_bw() +
+  
+  coord_flex_cart(bottom = capped_horizontal(capped = "both"), 
+                  left   = capped_vertical(capped = "both")) +
+  
+  background_grid("none") +
+  
+  guides(fill = "none") +
+  
+  theme(axis.line        = element_line(),
+        panel.border     = element_blank(),
+        text             = element_text(family = "sans"), 
+        axis.title       = element_text(family = "sans")) 
+
+
+p5 <- ggplot(filter(data_assay_plot, pib_level != "No PiB Data")) +
+  
+  geom_bar(aes(x = ptau_group,
+               fill = pib_level),
+           position = "fill") +
+  
+  scale_y_continuous(name   = "Proportion of participants in reference ranges",
+                     breaks = seq(0, 1, 0.25)) +
+  
+  scale_x_discrete(name = "",
+                   labels = c("<=0.40\npg/mL", "0.40-0.63\npg/mL",  ">=0.63\npg/mL")) +
+  
+  scale_fill_manual(name   = "",  
+                    values = c("#F18F01A6", "#9c1419A6")) +
+
+  theme_bw() +
+  
+  coord_flex_cart(bottom = capped_horizontal(capped = "both"), 
+                  left   = capped_vertical(capped = "both")) +
+  
+  background_grid("none") +
+  
+  guides(fill = "none") +
+  
+  theme(axis.line        = element_line(),
+        panel.border     = element_blank(),
+        text             = element_text(family = "sans"), 
+        axis.title       = element_text(family = "sans")) 
 
 ```
 
+
+```{r, fig.width=10, fig.height=6}
+
+layout <- "
+AAAB
+AAAB
+AAAB
+AAAB
+AAAB
+CCCC
+"
+
+p + p4 + guide_area() + plot_layout(guides = "collect", design = layout)
+
+ggsave(filename = file.path(dir_figures, "ptau_pib_full_ashton2021.png"), dpi = 300)
+
+p + p5 + guide_area() + plot_layout(guides = "collect", design = layout)
+
+ggsave(filename = file.path(dir_figures, "ptau_pib_ab_ashton2021.png"), dpi = 300)
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+### Relative pTau217 levels from earliest sample
+
+```{r, fig.width=10, fig.height=6}
+
+ggplot() +
+  
+  geom_path(data = filter(data_assay_plot, pib_level == "No PiB Data"),
+            aes(x     = age_visit,
+                y     = change_base,
+                color = pib_level,
+                group = reggie_id),
+            position  = position_dodge2(0.8),
+            # color     = plot_colors_alpha[1],
+            linewidth = 0.5) +
+  
+  geom_point(data = filter(data_assay_plot, pib_level == "No PiB Data"),
+             aes(x     = age_visit,
+                 y     = change_base,
+                 color = pib_level,
+                 fill  = pib_level,
+                 group = reggie_id),
+             
+             position = position_dodge2(0.8),
+             # color    = plot_colors_alpha[1],
+             # fill     = plot_colors_alpha[1],
+             shape    = 21,
+             size     = 1.5) +
+  
+  geom_path(data = filter(data_assay_plot, pib_level == "AB-"),
+            aes(x     = age_visit,
+                y     = change_base,
+                color = pib_level,
+                group = reggie_id),
+            
+            position  = position_dodge2(0.8),
+            # color     = plot_colors_alpha[2],
+            linewidth = 0.5) +
+  
+  geom_point(data = filter(data_assay_plot, pib_level == "AB-"),
+             aes(x     = age_visit,
+                 y     = change_base,
+                 color = pib_level,
+                 fill  = pib_level,
+                 group = reggie_id),
+             
+             position = position_dodge2(0.8),
+             # color    = plot_colors_alpha[2],
+             # fill     = plot_colors_alpha[2],
+             shape    = 21,
+             size     = 1.5) +
+  
+  geom_path(data = filter(data_assay_plot, pib_level == "AB+"),
+            aes(x     = age_visit,
+                y     = change_base,
+                color = pib_level,
+                group = reggie_id),
+            
+            position  = position_dodge2(0.8),
+            # color     = plot_colors_alpha[3],
+            linewidth = 0.5) +
+  
+  geom_point(data = filter(data_assay_plot, pib_level == "AB+"),
+             aes(x     = age_visit,
+                 y     = change_base,
+                 color = pib_level,
+                 fill  = pib_level,
+                 group = reggie_id),
+             
+             position = position_dodge2(0.8),
+             # color    = plot_colors[3],
+             # fill     = plot_colors_alpha[3],
+             shape    = 21,
+             size     = 1.5) +
+  
+  scale_color_manual(name   = expression(A*beta~"status"), 
+                     values = c("#F18F01A6", "#9c1419A6","#878a8940"),
+                     labels = c(bquote(A*beta*"-"), bquote(A*beta*"+"), "No data")) +
+  
+  scale_fill_manual(name    = expression(A*beta~"status"), 
+                     values = c("#F18F01A6", "#9c1419A6", "#878a8940"),
+                     labels = c(bquote(A*beta*"-"), bquote(A*beta*"+"), "No data")) +
+
+  scale_y_continuous(name   = expression("Fold change in [ "*pTau[217]*"] from first sample"),
+                     breaks = seq(-5, 5, 0.5)) +
+  
+  scale_x_continuous(name = "Age",
+                     breaks = seq(0, 100, 5)) +
+
+  theme_bw(base_size = 12) +
+  
+  coord_flex_cart(bottom = capped_horizontal(capped = "both"), 
+                  left   = capped_vertical(capped = "both")) +
+  
+  background_grid(major = "y") +
+  
+  theme(axis.line        = element_line(),
+        panel.border     = element_blank(),
+        panel.grid.major = element_line(linewidth = 0.25, 
+                                        linetype = "dotted"),
+        text             = element_text(family = "sans"), 
+        axis.title       = element_text(family = "sans"),
+        strip.background = element_rect(fill = "#680001"),
+        strip.text       = element_text(color = "white", 
+                                        size  = 10, 
+                                        face  = "bold")) +
+  
+  ggtitle(bquote("Relative" ~ pTau[217] ~ "in plasma from first sample"))
+
+# ggsave(filename = file.path(dir_figures, "relative_ptau_217_age_combined.png"), dpi = 300)
+  
+```
+
+
+
+
+### pTau217 levels
+```{r, fig.width=12, fig.height=8}
+
+ggplot(data_assay_plot,
+       aes(x     = age_visit,
+           y     = ptau_conc,
+           group = reggie_id,
+           color = pib_level,
+           fill  = pib_level)) +
+  
+  geom_path(position = position_dodge(0.8)) +
+  
+  geom_point(position = position_dodge(0.8),
+             shape    = 21) +
+  
+  scale_color_manual(name = "Last PiB Level", values = plot_colors) +
+  
+  scale_fill_manual(name = "Last PiB Level", values = plot_colors) +
+
+  scale_y_continuous(name   = expression("[ "*pTau[217]*"] in pg/ml"),
+                     #limits = c(-1, 2),
+                     breaks = seq(0, 5, 0.5)) +
+  
+  scale_x_continuous(name = "Years from first plasma sample") +
+
+  theme_bw(base_size = 12) +
+  
+  coord_flex_cart(bottom = capped_horizontal(capped = "both"), 
+                  left   = capped_vertical(capped = "both")) +
+  
+  background_grid(major = "y") +
+  
+  facet_rep_grid(bin_change ~ pib_level, repeat.tick.labels = T) +
+  
+  theme(axis.line        = element_line(),
+        panel.border     = element_blank(),
+        panel.grid.major = element_line(linewidth = 0.25, 
+                                        linetype = "dotted"),
+        text             = element_text(family = "sans"), 
+        axis.title       = element_text(family = "sans"),
+        strip.background = element_rect(fill = "#680001"),
+        strip.text       = element_text(color = "white", 
+                                        size  = 10, 
+                                        face  = "bold")) +
+  
+  ggtitle(bquote("Plot A: Absolute" ~ pTau[217] ~ "in plasma across visits"))
+
+# ggsave(filename = file.path(dir_figures, "absolute_ptau_217.png"), dpi = 300)
+
+```
+
+
+### Relative pTau217 levels from earliest sample
+```{r, fig.width=12, fig.height=8}
+
+ggplot(filter(data_assay_plot, time_visit > 0 & total_visits > 2),
+       aes(x     = time_visit,
+           y     = change_base,
+           group = reggie_id,
+           color = pib_level,
+           fill  = pib_level)) +
+  
+  geom_path(position = position_dodge(0.8),
+            #alpha    = 0.3
+            ) +
+  
+  geom_point(position = position_dodge(0.8),
+             #alpha    = 0.3,
+             shape    = 21) +
+  
+  # scale_colour_grey(start = 0.4, end = 0.7) +
+  # 
+  # scale_fill_grey(start = 0.4, end = 0.7) +
+  # 
+  scale_color_manual(name = "Last PiB Level", values = plot_colors) +
+  
+  scale_fill_manual(name = "Last PiB Level", values = plot_colors) +
+
+  scale_y_continuous(name   = expression(LOG[2]~"change in [ "*pTau[217]*"] from first visit"),
+                     #limits = c(-1, 2),
+                     breaks = seq(-5, 5, 0.5)) +
+  
+  scale_x_continuous(name = "Years from first plasma sample",
+                     breaks = seq(1, 50, 2)) +
+
+  theme_bw(base_size = 12) +
+  
+  coord_flex_cart(bottom = capped_horizontal(capped = "both"), 
+                  left   = capped_vertical(capped = "both")) +
+  
+  background_grid(major = "y") +
+  
+  facet_rep_grid(bin_change ~ pib_level, repeat.tick.labels = T) +
+  
+  theme(axis.line        = element_line(),
+        panel.border     = element_blank(),
+        panel.grid.major = element_line(linewidth = 0.25, 
+                                        linetype = "dotted"),
+        text             = element_text(family = "sans"), 
+        axis.title       = element_text(family = "sans"),
+        strip.background = element_rect(fill = "#680001"),
+        strip.text       = element_text(color = "white", 
+                                        size  = 10, 
+                                        face  = "bold")) +
+  
+  ggtitle(bquote("Plot B: Relative" ~ pTau[217] ~ "in plasma from first sample"))
+
+# ggsave(filename = file.path(dir_figures, "relative_ptau_217.png"), dpi = 300)
+  
+```
